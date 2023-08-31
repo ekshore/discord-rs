@@ -1761,12 +1761,65 @@ impl SenderExt for websocket::client::Sender<websocket::stream::WebSocketStream>
 	}
 }
 
+impl ReceiverExt
+	for tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>
+{
+	fn recv_json<F, T>(&mut self, decode: F) -> Result<T>
+	where
+		F: FnOnce(serde_json::Value) -> Result<T>,
+	{
+		use tungstenite::Message;
+
+		let message: Message = self.read_message().unwrap();
+		debug!("{}", message);
+
+		match message {
+			Message::Close(Some(frame)) => Err(Error::Closed(
+				Some(u16::from(frame.code)),
+				frame.reason.to_string(),
+			)),
+			Message::Text(msg) => serde_json::from_reader(msg.as_bytes())
+				.map_err(From::from)
+				.and_then(decode)
+				.map_err(|e| {
+					warn!("Error decoding: {}", msg);
+					e
+				}),
+			Message::Binary(payload) => {
+				use std::io::Read;
+				let mut payload_vec = Vec::new();
+				flate2::read::ZlibDecoder::new(payload.as_slice()).read_to_end(&mut payload_vec)?;
+				serde_json::from_reader(payload_vec.as_slice())
+					.map_err(From::from)
+					.and_then(decode)
+					.map_err(|e| {
+						warn!("Error decoding: {}", String::from_utf8_lossy(payload.as_slice()));
+						e
+					})
+			}
+			_ => Err(Error::Closed(None, message.to_string())),
+		}
+	}
+}
+
+impl SenderExt
+	for tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>
+{
+	fn send_json(&mut self, value: &serde_json::Value) -> Result<()> {
+		use tungstenite::Message;
+		serde_json::to_string(value)
+			.map(Message::Text)
+			.map_err(Error::from)
+			.and_then(|m| self.send(m).map_err(Error::from))
+	}
+}
+
 mod internal {
 	pub enum Status {
 		SendMessage(::serde_json::Value),
 		Sequence(u64),
 		ChangeInterval(u64),
-		ChangeSender(::websocket::client::Sender<::websocket::stream::WebSocketStream>),
+		ChangeSocket(crate::connection::SocketArtex),
 		Aborted,
 	}
 }

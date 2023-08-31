@@ -23,6 +23,8 @@ pub enum Error {
 	Json(JsonError),
 	/// A `websocket` crate error
 	WebSocket(WebSocketError),
+	/// A tungstenite crate error
+	Tungstenite(tungstenite::Error),
 	/// A `std::io` module error
 	Io(IoError),
 	/// An error in the Opus library, with the function name and error code
@@ -90,6 +92,12 @@ impl From<WebSocketError> for Error {
 	}
 }
 
+impl From<tungstenite::Error> for Error {
+	fn from(err: tungstenite::Error) -> Error {
+		Error::Tungstenite(err)
+	}
+}
+
 #[cfg(feature = "voice")]
 impl From<OpusError> for Error {
 	fn from(err: OpusError) -> Error {
@@ -122,6 +130,7 @@ impl StdError for Error {
 			Error::Chrono(ref inner) => inner.description(),
 			Error::Json(ref inner) => inner.description(),
 			Error::WebSocket(ref inner) => inner.description(),
+			Error::Tungstenite(ref inner) => inner.description(),
 			Error::Io(ref inner) => inner.description(),
 			#[cfg(feature = "voice")]
 			Error::Opus(ref inner) => inner.description(),

@@ -1,9 +1,8 @@
 #[cfg(feature = "voice")]
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
-use websocket::client::{Client, Receiver, Sender};
-use websocket::stream::WebSocketStream;
+use tungstenite;
 
 use serde_json;
 
@@ -101,7 +100,8 @@ impl<'a> ConnectionBuilder<'a> {
 /// Websocket connection to the Discord servers.
 pub struct Connection {
 	keepalive_channel: mpsc::Sender<Status>,
-	receiver: Receiver<WebSocketStream>,
+	// receiver: Receiver<WebSocketStream>,
+	socket: SocketArtex,
 	#[cfg(feature = "voice")]
 	voice_handles: HashMap<Option<ServerId>, VoiceConnection>,
 	#[cfg(feature = "voice")]
@@ -112,6 +112,9 @@ pub struct Connection {
 	last_sequence: u64,
 	identify: serde_json::Value,
 }
+
+pub type SocketArtex =
+	Arc<Mutex<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>>>;
 
 impl Connection {
 	/// Establish a connection to the Discord websocket servers.
@@ -140,34 +143,36 @@ impl Connection {
 		identify: serde_json::Value,
 	) -> Result<(Connection, ReadyEvent)> {
 		trace!("Gateway: {}", base_url);
+
 		// establish the websocket connection
-		let url = build_gateway_url(base_url)?;
-		let response = Client::connect(url)?.send()?;
-		response.validate()?;
-		let (mut sender, mut receiver) = response.begin().split();
+		let ws_url = build_url(base_url);
+		let (mut socket, _res) = tungstenite::connect(&ws_url)?;
 
 		// send the handshake
-		sender.send_json(&identify)?;
+		socket.send_json(&identify)?;
 
 		// read the Hello and spawn the keepalive thread
 		let heartbeat_interval;
-		match receiver.recv_json(GatewayEvent::decode)? {
+		match socket.recv_json(GatewayEvent::decode)? {
 			GatewayEvent::Hello(interval) => heartbeat_interval = interval,
 			other => {
-				debug!("Unexpected event: {:?}", other);
+				debug!("unexpected event: {:?}", other);
 				return Err(Error::Protocol("Expected Hello during handshake"));
 			}
 		}
 
+		let socket: SocketArtex = Arc::new(Mutex::new(socket));
 		let (tx, rx) = mpsc::channel();
-		::std::thread::Builder::new()
-			.name("Discord Keepalive".into())
-			.spawn(move || keepalive(heartbeat_interval, sender, rx))?;
+		let socket_clone = Arc::clone(&socket);
+		std::thread::Builder::new()
+			.name("Discord Keepalive tungstenite".into())
+			.spawn(move || keepalive(heartbeat_interval, socket_clone, rx))?;
 
 		// read the Ready event
 		let sequence;
 		let ready;
-		match receiver.recv_json(GatewayEvent::decode)? {
+		let event = socket.lock().expect("Socket Mutex Poisoned").recv_json(GatewayEvent::decode)?;
+		match event {
 			GatewayEvent::Dispatch(seq, Event::Ready(event)) => {
 				sequence = seq;
 				ready = event;
@@ -175,7 +180,7 @@ impl Connection {
 			GatewayEvent::InvalidateSession => {
 				debug!("Session invalidated, reidentifying");
 				let _ = tx.send(Status::SendMessage(identify.clone()));
-				match receiver.recv_json(GatewayEvent::decode)? {
+				match socket.lock().expect("Socket Mutex Poisoned").recv_json(GatewayEvent::decode)? {
 					GatewayEvent::Dispatch(seq, Event::Ready(event)) => {
 						sequence = seq;
 						ready = event;
@@ -211,7 +216,7 @@ impl Connection {
 		Ok((
 			finish_connection!(
 				keepalive_channel: tx,
-				receiver: receiver,
+				socket: socket,
 				ws_url: base_url.to_owned(),
 				token: token.to_owned(),
 				session_id: Some(session_id),
@@ -296,7 +301,8 @@ impl Connection {
 	/// Receive an event over the websocket, blocking until one is available.
 	pub fn recv_event(&mut self) -> Result<Event> {
 		loop {
-			match self.receiver.recv_json(GatewayEvent::decode) {
+			let res = self.socket.lock().expect("Socket Mutex Poisoned").recv_json(GatewayEvent::decode);
+			match res {
 				Err(Error::WebSocket(err)) => {
 					warn!("Websocket error, reconnecting: {:?}", err);
 					// Try resuming if we haven't received an InvalidateSession
@@ -399,17 +405,19 @@ impl Connection {
 
 	/// Resume using our existing session
 	fn resume(&mut self, session_id: String) -> Result<Event> {
+		use tungstenite::protocol::frame::{ CloseFrame, coding };
+		use std::borrow::Cow;
+
 		sleep_ms(1000);
 		trace!("Resuming...");
 		// close connection and re-establish
-		self.receiver
-			.get_mut()
-			.get_mut()
-			.shutdown(::std::net::Shutdown::Both)?;
-		let url = build_gateway_url(&self.ws_url)?;
-		let response = Client::connect(url)?.send()?;
-		response.validate()?;
-		let (mut sender, mut receiver) = response.begin().split();
+		let _ = self.socket.lock().expect("Socket Mutex Poisened").close(Some(CloseFrame {
+			code: coding::CloseCode::Normal,
+			reason: Cow::from("")
+		}));
+
+		let url = build_url(&self.ws_url);
+		let (mut socket, _) = tungstenite::connect(url).expect("Failed to connect to discord");
 
 		// send the resume request
 		let resume = json! {{
@@ -420,12 +428,12 @@ impl Connection {
 				"session_id": session_id,
 			}
 		}};
-		sender.send_json(&resume)?;
+		socket.send_json(&resume)?;
 
 		// TODO: when Discord has implemented it, observe the RESUMING event here
 		let first_event;
 		loop {
-			match receiver.recv_json(GatewayEvent::decode)? {
+			match socket.recv_json(GatewayEvent::decode)? {
 				GatewayEvent::Hello(interval) => {
 					let _ = self
 						.keepalive_channel
@@ -444,7 +452,7 @@ impl Connection {
 				}
 				GatewayEvent::InvalidateSession => {
 					debug!("Session invalidated in resume, reidentifying");
-					sender.send_json(&self.identify)?;
+					socket.send_json(&self.identify)?;
 				}
 				other => {
 					debug!("Unexpected event: {:?}", other);
@@ -454,8 +462,9 @@ impl Connection {
 		}
 
 		// switch everything to the new connection
-		self.receiver = receiver;
-		let _ = self.keepalive_channel.send(Status::ChangeSender(sender));
+		self.socket = Arc::new(Mutex::new(socket));
+		let socket = Arc::clone(&self.socket);
+		let _ = self.keepalive_channel.send(Status::ChangeSocket(socket));
 		Ok(first_event)
 	}
 
@@ -468,15 +477,16 @@ impl Connection {
 
 	// called from shutdown() and drop()
 	fn inner_shutdown(&mut self) -> Result<()> {
-		use std::io::Write;
-		use websocket::Sender as S;
+		use std::borrow::Cow;
+		use tungstenite::protocol::frame::{ coding::CloseCode, CloseFrame };
 
-		// Hacky horror: get the WebSocketStream from the Receiver and formally close it
-		let stream = self.receiver.get_mut().get_mut();
-		Sender::new(stream.by_ref(), true)
-			.send_message(&::websocket::message::Message::close_because(1000, ""))?;
-		stream.flush()?;
-		stream.shutdown(::std::net::Shutdown::Both)?;
+		let mut socket = self.socket.lock().expect("Socket Mutex Poisoned");
+		let _ = socket.flush();
+		let _ = socket.close(Some(CloseFrame {
+			code: CloseCode::Normal,
+			reason: Cow::Owned("".to_string()),
+		}));
+
 		self.keepalive_channel
 			.send(Status::Aborted)
 			.expect("Could not stop the keepalive thread, there will be a thread leak.");
@@ -484,12 +494,11 @@ impl Connection {
 	}
 
 	// called when we want to drop the connection with no fanfare
-	fn raw_shutdown(mut self) {
-		use std::io::Write;
+	fn raw_shutdown(self) {
 		{
-			let stream = self.receiver.get_mut().get_mut();
-			let _ = stream.flush();
-			let _ = stream.shutdown(::std::net::Shutdown::Both);
+			let mut socket = self.socket.lock().expect("Socket Mutex Poisoned");
+			let _ = socket.flush();
+			let _ = socket.close(None);
 		}
 		::std::mem::forget(self); // don't call inner_shutdown()
 	}
@@ -551,12 +560,12 @@ impl Drop for Connection {
 }
 
 #[inline]
-fn build_gateway_url(base: &str) -> Result<::websocket::client::request::Url> {
-	::websocket::client::request::Url::parse(&format!("{}?v={}", base, GATEWAY_VERSION))
-		.map_err(|_| Error::Other("Invalid gateway URL"))
+fn build_url(base: &str) -> url::Url {
+	url::Url::parse(&format!("{}?v={}", base, GATEWAY_VERSION)).expect("Failed to parse Url")
 }
 
-fn keepalive(interval: u64, mut sender: Sender<WebSocketStream>, channel: mpsc::Receiver<Status>) {
+fn keepalive(interval: u64, mut socket: SocketArtex, channel: mpsc::Receiver<Status>) {
+	debug!("Starting keep alive loop");
 	let mut timer = Timer::new(interval);
 	let mut last_sequence = 0;
 
@@ -565,7 +574,7 @@ fn keepalive(interval: u64, mut sender: Sender<WebSocketStream>, channel: mpsc::
 
 		loop {
 			match channel.try_recv() {
-				Ok(Status::SendMessage(val)) => match sender.send_json(&val) {
+				Ok(Status::SendMessage(val)) => match socket.lock().expect("Socket Mutex Poisoned").send_json(&val) {
 					Ok(()) => {}
 					Err(e) => warn!("Error sending gateway message: {:?}", e),
 				},
@@ -575,8 +584,8 @@ fn keepalive(interval: u64, mut sender: Sender<WebSocketStream>, channel: mpsc::
 				Ok(Status::ChangeInterval(interval)) => {
 					timer = Timer::new(interval);
 				}
-				Ok(Status::ChangeSender(new_sender)) => {
-					sender = new_sender;
+				Ok(Status::ChangeSocket(new_socket)) => {
+					socket = new_socket;
 				}
 				Ok(Status::Aborted) => break 'outer,
 				Err(mpsc::TryRecvError::Empty) => break,
@@ -589,11 +598,11 @@ fn keepalive(interval: u64, mut sender: Sender<WebSocketStream>, channel: mpsc::
 				"op": 1,
 				"d": last_sequence
 			}};
-			match sender.send_json(&map) {
+			match socket.lock().expect("Socket Mutex Poisoned").send_json(&map) {
 				Ok(()) => {}
-				Err(e) => warn!("Error sending gateway keeaplive: {:?}", e),
+				Err(e) => warn!("Error sending gateway keepalive: {:?}", e),
 			}
 		}
 	}
-	let _ = sender.get_mut().shutdown(::std::net::Shutdown::Both);
+	let _ = socket.lock().expect("Socket Mutex Poisoned").close(None);
 }
