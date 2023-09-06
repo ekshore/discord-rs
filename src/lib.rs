@@ -34,7 +34,6 @@ extern crate hyper;
 extern crate hyper_native_tls;
 extern crate multipart;
 extern crate serde;
-extern crate websocket;
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
@@ -1710,57 +1709,6 @@ trait SenderExt {
 	fn send_json(&mut self, value: &serde_json::Value) -> Result<()>;
 }
 
-impl ReceiverExt for websocket::client::Receiver<websocket::stream::WebSocketStream> {
-	fn recv_json<F, T>(&mut self, decode: F) -> Result<T>
-	where
-		F: FnOnce(serde_json::Value) -> Result<T>,
-	{
-		use websocket::message::{Message, Type};
-		use websocket::ws::receiver::Receiver;
-		let message: Message = self.recv_message()?;
-		if message.opcode == Type::Close {
-			Err(Error::Closed(
-				message.cd_status_code,
-				String::from_utf8_lossy(&message.payload).into_owned(),
-			))
-		} else if message.opcode == Type::Binary || message.opcode == Type::Text {
-			let mut payload_vec;
-			let payload = if message.opcode == Type::Binary {
-				use std::io::Read;
-				payload_vec = Vec::new();
-				flate2::read::ZlibDecoder::new(&message.payload[..])
-					.read_to_end(&mut payload_vec)?;
-				&payload_vec[..]
-			} else {
-				&message.payload[..]
-			};
-			serde_json::from_reader(payload)
-				.map_err(From::from)
-				.and_then(decode)
-				.map_err(|e| {
-					warn!("Error decoding: {}", String::from_utf8_lossy(payload));
-					e
-				})
-		} else {
-			Err(Error::Closed(
-				None,
-				String::from_utf8_lossy(&message.payload).into_owned(),
-			))
-		}
-	}
-}
-
-impl SenderExt for websocket::client::Sender<websocket::stream::WebSocketStream> {
-	fn send_json(&mut self, value: &serde_json::Value) -> Result<()> {
-		use websocket::message::Message;
-		use websocket::ws::sender::Sender;
-		serde_json::to_string(value)
-			.map(Message::text)
-			.map_err(Error::from)
-			.and_then(|m| self.send_message(&m).map_err(Error::from))
-	}
-}
-
 impl ReceiverExt
 	for tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>
 {
@@ -1770,7 +1718,48 @@ impl ReceiverExt
 	{
 		use tungstenite::Message;
 
-		let message: Message = self.read_message().unwrap();
+		let message: Message = self.read().unwrap();
+		debug!("{}", message);
+
+		match message {
+			Message::Close(Some(frame)) => Err(Error::Closed(
+				Some(u16::from(frame.code)),
+				frame.reason.to_string(),
+			)),
+			Message::Text(msg) => serde_json::from_reader(msg.as_bytes())
+				.map_err(From::from)
+				.and_then(decode)
+				.map_err(|e| {
+					warn!("Error decoding: {}", msg);
+					e
+				}),
+			Message::Binary(payload) => {
+				use std::io::Read;
+				let mut payload_vec = Vec::new();
+				flate2::read::ZlibDecoder::new(payload.as_slice()).read_to_end(&mut payload_vec)?;
+				serde_json::from_reader(payload_vec.as_slice())
+					.map_err(From::from)
+					.and_then(decode)
+					.map_err(|e| {
+						warn!("Error decoding: {}", String::from_utf8_lossy(payload.as_slice()));
+						e
+					})
+			}
+			_ => Err(Error::Closed(None, message.to_string())),
+		}
+	}
+}
+
+impl ReceiverExt
+	for tungstenite::WebSocket<mio::net::TcpStream>
+{
+	fn recv_json<F, T>(&mut self, decode: F) -> Result<T>
+	where
+		F: FnOnce(serde_json::Value) -> Result<T>,
+	{
+		use tungstenite::Message;
+
+		let message: Message = self.read().unwrap();
 		debug!("{}", message);
 
 		match message {
@@ -1805,6 +1794,16 @@ impl ReceiverExt
 impl SenderExt
 	for tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>
 {
+	fn send_json(&mut self, value: &serde_json::Value) -> Result<()> {
+		use tungstenite::Message;
+		serde_json::to_string(value)
+			.map(Message::Text)
+			.map_err(Error::from)
+			.and_then(|m| self.send(m).map_err(Error::from))
+	}
+}
+
+impl SenderExt for tungstenite::WebSocket<mio::net::TcpStream> {
 	fn send_json(&mut self, value: &serde_json::Value) -> Result<()> {
 		use tungstenite::Message;
 		serde_json::to_string(value)

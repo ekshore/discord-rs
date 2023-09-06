@@ -303,7 +303,7 @@ impl Connection {
 		loop {
 			let res = self.socket.lock().expect("Socket Mutex Poisoned").recv_json(GatewayEvent::decode);
 			match res {
-				Err(Error::WebSocket(err)) => {
+				Err(Error::Tungstenite(err)) => {
 					warn!("Websocket error, reconnecting: {:?}", err);
 					// Try resuming if we haven't received an InvalidateSession
 					if let Some(session_id) = self.session_id.clone() {
