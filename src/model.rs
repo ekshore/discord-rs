@@ -871,6 +871,8 @@ pub struct Message {
 	pub referenced_message: Option<Box<Message>>,
 
 	pub flags: MessageFlags,
+	#[serde(rename = "guild_id")]
+	pub server_id: Option<ServerId>,
 }
 serial_decode!(Message);
 
