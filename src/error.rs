@@ -7,7 +7,6 @@ use serde_json::Value;
 use std::error::Error as StdError;
 use std::fmt::Display;
 use std::io::Error as IoError;
-use websocket::result::WebSocketError;
 
 /// Discord API `Result` alias type.
 pub type Result<T> = ::std::result::Result<T, Error>;
@@ -21,8 +20,8 @@ pub enum Error {
 	Chrono(ChronoError),
 	/// A `serde_json` crate error
 	Json(JsonError),
-	/// A `websocket` crate error
-	WebSocket(WebSocketError),
+	/// A tungstenite crate error
+	Tungstenite(tungstenite::Error),
 	/// A `std::io` module error
 	Io(IoError),
 	/// An error in the Opus library, with the function name and error code
@@ -84,9 +83,9 @@ impl From<JsonError> for Error {
 	}
 }
 
-impl From<WebSocketError> for Error {
-	fn from(err: WebSocketError) -> Error {
-		Error::WebSocket(err)
+impl From<tungstenite::Error> for Error {
+	fn from(err: tungstenite::Error) -> Error {
+		Error::Tungstenite(err)
 	}
 }
 
@@ -104,7 +103,6 @@ impl Display for Error {
 			Error::Hyper(ref inner) => inner.fmt(f),
 			Error::Chrono(ref inner) => inner.fmt(f),
 			Error::Json(ref inner) => inner.fmt(f),
-			Error::WebSocket(ref inner) => inner.fmt(f),
 			Error::Io(ref inner) => inner.fmt(f),
 			#[cfg(feature = "voice")]
 			Error::Opus(ref inner) => inner.fmt(f),
@@ -121,7 +119,7 @@ impl StdError for Error {
 			Error::Hyper(ref inner) => inner.description(),
 			Error::Chrono(ref inner) => inner.description(),
 			Error::Json(ref inner) => inner.description(),
-			Error::WebSocket(ref inner) => inner.description(),
+			Error::Tungstenite(ref inner) => inner.description(),
 			Error::Io(ref inner) => inner.description(),
 			#[cfg(feature = "voice")]
 			Error::Opus(ref inner) => inner.description(),
@@ -140,7 +138,6 @@ impl StdError for Error {
 			Error::Hyper(ref inner) => Some(inner),
 			Error::Chrono(ref inner) => Some(inner),
 			Error::Json(ref inner) => Some(inner),
-			Error::WebSocket(ref inner) => Some(inner),
 			Error::Io(ref inner) => Some(inner),
 			#[cfg(feature = "voice")]
 			Error::Opus(ref inner) => Some(inner),

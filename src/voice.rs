@@ -6,24 +6,25 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::UdpSocket;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use opus;
 use serde_json;
 use sodiumoxide::crypto::secretbox as crypto;
-use websocket::client::{Client, Sender};
-use websocket::stream::WebSocketStream;
+use tungstenite;
 
-use model::*;
-use {Error, ReceiverExt, Result, SenderExt};
+use crate::internal;
+use crate::model::*;
+use crate::Timer;
+use crate::{Error, ReceiverExt, Result, SenderExt};
 
 /// An active or inactive voice connection, obtained from `Connection::voice`.
 pub struct VoiceConnection {
 	// primary WS send control
 	server_id: Option<ServerId>, // None for group and private calls
 	user_id: UserId,
-	main_ws: mpsc::Sender<::internal::Status>,
+	main_ws: mpsc::Sender<internal::Status>,
 	channel_id: Option<ChannelId>,
 	mute: bool,
 	deaf: bool,
@@ -89,7 +90,7 @@ impl VoiceConnection {
 	pub fn __new(
 		server_id: Option<ServerId>,
 		user_id: UserId,
-		main_ws: mpsc::Sender<::internal::Status>,
+		main_ws: mpsc::Sender<internal::Status>,
 	) -> Self {
 		let (tx, rx) = mpsc::channel();
 		start_voice_thread(server_id, rx);
@@ -150,7 +151,7 @@ impl VoiceConnection {
 
 	/// Send the connect/disconnect command over the main websocket
 	fn send_connect(&self) {
-		let _ = self.main_ws.send(::internal::Status::SendMessage(json! {{
+		let _ = self.main_ws.send(internal::Status::SendMessage(json! {{
 			"op": 4,
 			"d": {
 				"guild_id": self.server_id,
@@ -425,7 +426,7 @@ fn voice_thread(channel: mpsc::Receiver<Status>) {
 	let mut audio_source = None;
 	let mut receiver = None;
 	let mut connection = None;
-	let mut audio_timer = ::Timer::new(20);
+	let mut audio_timer = Timer::new(20);
 
 	// start the main loop
 	'outer: loop {
@@ -463,6 +464,20 @@ fn voice_thread(channel: mpsc::Receiver<Status>) {
 	}
 }
 
+fn connect_to_some(
+	addrs: &[std::net::SocketAddr],
+	uri: &tungstenite::http::Uri,
+) -> Result<mio::net::TcpStream> {
+	for addr in addrs {
+		if let Ok(stream) = mio::net::TcpStream::connect(*addr) {
+			return Ok(stream);
+		}
+	}
+	Err(Error::Tungstenite(tungstenite::Error::Url(
+		tungstenite::error::UrlError::UnableToConnect(uri.to_string()),
+	)))
+}
+
 struct ConnStartInfo {
 	// may have originally been a ServerId or ChannelId
 	server_id: u64,
@@ -473,7 +488,8 @@ struct ConnStartInfo {
 }
 
 struct InternalConnection {
-	sender: Sender<WebSocketStream>,
+	socket: Arc<Mutex<tungstenite::WebSocket<mio::net::TcpStream>>>,
+	// sender: Sender<WebSocketStream>,
 	receive_chan: mpsc::Receiver<RecvStatus>,
 	ws_close: mpsc::Sender<()>,
 	udp_close: mpsc::Sender<()>,
@@ -488,8 +504,8 @@ struct InternalConnection {
 	decoder_map: HashMap<(u32, opus::Channels), opus::Decoder>,
 	encoder: opus::Encoder,
 	encoder_stereo: bool,
-	keepalive_timer: ::Timer,
-	audio_keepalive_timer: ::Timer,
+	keepalive_timer: Timer,
+	audio_keepalive_timer: Timer,
 	ws_thread: Option<::std::thread::JoinHandle<()>>,
 	udp_thread: Option<::std::thread::JoinHandle<()>>,
 }
@@ -507,6 +523,9 @@ impl InternalConnection {
 			token,
 		} = info;
 
+		use std::net::ToSocketAddrs;
+		use tungstenite::client::IntoClientRequest;
+		use tungstenite::error::UrlError;
 		// prepare the URL: drop the :80 and prepend wss://
 		if endpoint.ends_with(":80") {
 			let len = endpoint.len();
@@ -514,13 +533,41 @@ impl InternalConnection {
 		}
 		// establish the websocket connection
 		// v=4 as described at https://discord.com/developers/docs/topics/voice-connections#voice-gateway-versioning-gateway-versions
-		let url = match ::websocket::client::request::Url::parse(&format!("wss://{}?v=4", endpoint)) {
+		let url = match url::Url::parse(&format!("wss://{}?v=4", endpoint)) {
 			Ok(url) => url,
 			Err(_) => return Err(Error::Other("Invalid endpoint URL")),
 		};
-		let response = Client::connect(url)?.send()?;
-		response.validate()?;
-		let (mut sender, mut receiver) = response.begin().split();
+
+		let req = url
+			.clone()
+			.into_client_request()
+			.expect("Error parsing url into request");
+		let uri = req.uri();
+
+		let host = req
+			.uri()
+			.host()
+			.ok_or(Error::Tungstenite(tungstenite::Error::Url(
+				UrlError::NoHostName,
+			)))?;
+
+		let port = req.uri().port_u16().unwrap_or(match uri.scheme_str() {
+			Some("ws") => Ok(80),   // Plain
+			Some("wss") => Ok(443), // TLS
+			_ => Err(Error::Tungstenite(tungstenite::Error::Url(
+				UrlError::UnsupportedUrlScheme,
+			))),
+		}?);
+
+		let addrs = (host, port).to_socket_addrs()?;
+		let stream = connect_to_some(addrs.as_slice(), uri)?;
+
+		let mut socket = match tungstenite::client(url, stream) {
+			Ok((socket, _)) => Ok(socket),
+			Err(e) => Err(Error::Tungstenite(tungstenite::Error::Url(
+				tungstenite::error::UrlError::UnableToConnect(e.to_string()),
+			))),
+		}?;
 
 		// send the handshake
 		let map = json! {{
@@ -532,11 +579,11 @@ impl InternalConnection {
 				"token": token,
 			}
 		}};
-		sender.send_json(&map)?;
+		socket.send_json(&map)?;
 
 		let mut interval = 10_000; // crappy guess in case we fail to receive one
 		let (port, ssrc, modes, ip) = loop {
-			match receiver.recv_json(VoiceEvent::decode)? {
+			match socket.recv_json(VoiceEvent::decode)? {
 				VoiceEvent::Hello { heartbeat_interval } => {
 					interval = heartbeat_interval;
 				}
@@ -562,7 +609,6 @@ impl InternalConnection {
 
 		// bind a UDP socket and send the ssrc value in a packet as identification
 		let destination = {
-			use std::net::ToSocketAddrs;
 			(ip.as_ref().map(|ip| &ip[..]).unwrap_or(&endpoint[..]), port)
 				.to_socket_addrs()?
 				.next()
@@ -605,13 +651,13 @@ impl InternalConnection {
 					}
 				}
 			}};
-			sender.send_json(&map)?;
+			socket.send_json(&map)?;
 		}
 
 		// discard websocket messages until we get the Ready
 		let encryption_key;
 		loop {
-			match receiver.recv_json(VoiceEvent::decode)? {
+			match socket.recv_json(VoiceEvent::decode)? {
 				VoiceEvent::Hello { heartbeat_interval } => {
 					// Not hit in usual operation; just for coverage.
 					interval = heartbeat_interval;
@@ -633,6 +679,9 @@ impl InternalConnection {
 			}
 		}
 
+		let socket = Arc::new(Mutex::new(socket));
+		let socket_clone = Arc::clone(&socket);
+
 		// start two child threads: one for the voice websocket and another for UDP voice packets
 		let thread = ::std::thread::current();
 		let thread_name = thread.name().unwrap_or("discord voice");
@@ -643,57 +692,51 @@ impl InternalConnection {
 			let (tx1, rx) = mpsc::channel();
 			let tx2 = tx1.clone();
 			let udp_clone = udp.try_clone()?;
-			let ws_thread = Some(try!(::std::thread::Builder::new()
-				.name(format!("{} (WS reader)", thread_name))
-				.spawn(move || {
-					{
-						match *receiver.get_mut().get_mut() {
-							WebSocketStream::Tcp(ref inner) => inner.set_nonblocking(true).unwrap(),
-							WebSocketStream::Ssl(ref inner) => inner
-								.lock()
-								.unwrap()
-								.get_ref()
-								.set_nonblocking(true)
-								.unwrap(),
-						};
-					}
-					loop {
-						while let Ok(msg) = receiver.recv_json(VoiceEvent::decode) {
-							match tx1.send(RecvStatus::Websocket(msg)) {
-								Ok(()) => {}
-								Err(_) => return,
+			let ws_thread = Some(
+				::std::thread::Builder::new()
+					.name(format!("{} (WS reader)", thread_name))
+					.spawn(move || {
+						loop {
+							while let Ok(msg) = socket_clone.lock().expect("Socket Mutex Poisoned").recv_json(VoiceEvent::decode) {
+								match tx1.send(RecvStatus::Websocket(msg)) {
+									Ok(()) => {}
+									Err(_) => return,
+								}
+							}
+							if let Ok(_) = ws_reader_close.try_recv() {
+								return;
+							}
+							::std::thread::sleep(::std::time::Duration::from_millis(25));
+						}
+					})?,
+			);
+			let udp_thread = Some(
+				::std::thread::Builder::new()
+					.name(format!("{} (UDP reader)", thread_name))
+					.spawn(move || {
+						udp_clone
+							.set_read_timeout(Some(::std::time::Duration::from_millis(100)))
+							.unwrap();
+						let mut buffer = [0; 512];
+						loop {
+							if let Ok((len, _)) = udp_clone.recv_from(&mut buffer) {
+								match tx2.send(RecvStatus::Udp(buffer[..len].to_vec())) {
+									Ok(()) => {}
+									Err(_) => return,
+								}
+							} else if let Ok(_) = udp_reader_close.try_recv() {
+								return;
 							}
 						}
-						if let Ok(_) = ws_reader_close.try_recv() {
-							return;
-						}
-						::std::thread::sleep(::std::time::Duration::from_millis(25));
-					}
-				})));
-			let udp_thread = Some(try!(::std::thread::Builder::new()
-				.name(format!("{} (UDP reader)", thread_name))
-				.spawn(move || {
-					udp_clone
-						.set_read_timeout(Some(::std::time::Duration::from_millis(100)))
-						.unwrap();
-					let mut buffer = [0; 512];
-					loop {
-						if let Ok((len, _)) = udp_clone.recv_from(&mut buffer) {
-							match tx2.send(RecvStatus::Udp(buffer[..len].to_vec())) {
-								Ok(()) => {}
-								Err(_) => return,
-							}
-						} else if let Ok(_) = udp_reader_close.try_recv() {
-							return;
-						}
-					}
-				})));
+					})?,
+			);
 			(rx, ws_thread, udp_thread)
 		};
 
 		info!("Voice connected to {} ({})", endpoint, destination);
+		#[allow(non_shorthand_field_patterns)]
 		Ok(InternalConnection {
-			sender: sender,
+			socket: socket,
 			receive_chan: receive_chan,
 			ws_close: ws_sender_close,
 			udp_close: udp_sender_close,
@@ -715,9 +758,9 @@ impl InternalConnection {
 				opus::Application::Audio,
 			)?,
 			encoder_stereo: false,
-			keepalive_timer: ::Timer::new(interval),
+			keepalive_timer: Timer::new(interval),
 			// after 5 minutes of us sending nothing, Discord will stop sending voice data to us
-			audio_keepalive_timer: ::Timer::new(4 * 60 * 1000),
+			audio_keepalive_timer: Timer::new(4 * 60 * 1000),
 
 			ws_thread: ws_thread,
 			udp_thread: udp_thread,
@@ -728,7 +771,7 @@ impl InternalConnection {
 		&mut self,
 		source: &mut Option<Box<dyn AudioSource>>,
 		receiver: &mut Option<Box<dyn AudioReceiver>>,
-		audio_timer: &mut ::Timer,
+		audio_timer: &mut Timer,
 	) -> Result<()> {
 		let mut audio_buffer = [0i16; 960 * 2]; // 20 ms, stereo
 		let mut packet = [0u8; 512]; // 256 forces opus to reduce bitrate for some packets
@@ -786,7 +829,7 @@ impl InternalConnection {
 				"op": 3,
 				"d": serde_json::Value::Null,
 			}};
-			self.sender.send_json(&map)?;
+			self.socket.lock().expect("Socket Mutext Poisoned").send_json(&map)?;
 		}
 
 		// Send the UDP keepalive if needed
@@ -892,7 +935,7 @@ impl InternalConnection {
 				"delay": 0,
 			}
 		}};
-		self.sender.send_json(&map)
+		self.socket.lock().expect("Socket Mutex Poisoned").send_json(&map)
 	}
 }
 
