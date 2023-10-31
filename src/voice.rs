@@ -9,10 +9,12 @@ use std::net::UdpSocket;
 use std::sync::{mpsc, Arc, Mutex};
 
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use mio::net::TcpStream;
 use opus;
 use serde_json;
 use sodiumoxide::crypto::secretbox as crypto;
 use tungstenite;
+use tungstenite::stream::MaybeTlsStream;
 
 use crate::internal;
 use crate::model::*;
@@ -20,6 +22,7 @@ use crate::Timer;
 use crate::{Error, ReceiverExt, Result, SenderExt};
 
 /// An active or inactive voice connection, obtained from `Connection::voice`.
+#[derive(Debug)]
 pub struct VoiceConnection {
 	// primary WS send control
 	server_id: Option<ServerId>, // None for group and private calls
@@ -151,6 +154,7 @@ impl VoiceConnection {
 
 	/// Send the connect/disconnect command over the main websocket
 	fn send_connect(&self) {
+		debug!("send_connect &self: {:?}", &self);
 		let _ = self.main_ws.send(internal::Status::SendMessage(json! {{
 			"op": 4,
 			"d": {
@@ -488,7 +492,8 @@ struct ConnStartInfo {
 }
 
 struct InternalConnection {
-	socket: Arc<Mutex<tungstenite::WebSocket<mio::net::TcpStream>>>,
+	socket: Arc<Mutex<tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>>>,
+	//socket: Arc<Mutex<tungstenite::WebSocket<mio::net::TcpStream>>>,
 	// sender: Sender<WebSocketStream>,
 	receive_chan: mpsc::Receiver<RecvStatus>,
 	ws_close: mpsc::Sender<()>,
@@ -559,13 +564,17 @@ impl InternalConnection {
 			))),
 		}?);
 
+		debug!("Host: {}, Port: {}", host, port);
 		let addrs = (host, port).to_socket_addrs()?;
 		let stream = connect_to_some(addrs.as_slice(), uri)?;
 
-		let mut socket = match tungstenite::client(url, stream) {
+		debug!("{:?}", &stream);
+
+		//let mut socket = match tungstenite::client(url, stream) {
+		let mut socket = match tungstenite::connect(url) {
 			Ok((socket, _)) => Ok(socket),
 			Err(e) => Err(Error::Tungstenite(tungstenite::Error::Url(
-				tungstenite::error::UrlError::UnableToConnect(e.to_string()),
+				tungstenite::error::UrlError::UnableToConnect(format!("This is where things are braking: {:?}", e)),
 			))),
 		}?;
 
@@ -580,6 +589,7 @@ impl InternalConnection {
 			}
 		}};
 		socket.send_json(&map)?;
+		debug!("We have sent the handshake event for the voice connection");
 
 		let mut interval = 10_000; // crappy guess in case we fail to receive one
 		let (port, ssrc, modes, ip) = loop {

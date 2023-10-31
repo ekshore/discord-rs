@@ -2514,6 +2514,7 @@ impl GatewayEvent {
 			value.remove("t");
 		}
 		warn_field("GatewayEvent", value);
+		debug!("Inbound GatewayEvent: {:?}", event);
 		Ok(event)
 	}
 }

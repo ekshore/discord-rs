@@ -144,12 +144,24 @@ impl Connection {
 	) -> Result<(Connection, ReadyEvent)> {
 		trace!("Gateway: {}", base_url);
 
+		// Try this with mio stream this is my last attempt before tokio
+		use mio::net::TcpStream;
+
+		let uri = request.uri();
+        let mode = uri_mode(uri)?;
+        let host = request.uri().host().ok_or(Error::Url(UrlError::NoHostName))?;
+        let host = if host.starts_with('[') { &host[1..host.len() - 1] } else { host };
+        let port = uri.port_u16().unwrap_or(match mode {
+            Mode::Plain => 80,
+            Mode::Tls => 443,
+        });
+        let addrs = (host, port).to_socket_addrs()?;
+        let mut stream = connect_to_some(addrs.as_slice(), request.uri())?;
+
+
 		// establish the websocket connection
 		let ws_url = build_url(base_url);
 		let (mut socket, _res) = tungstenite::connect(&ws_url)?;
-
-		// send the handshake
-		socket.send_json(&identify)?;
 
 		// read the Hello and spawn the keepalive thread
 		let heartbeat_interval;
@@ -161,12 +173,27 @@ impl Connection {
 			}
 		}
 
+		match socket.send_json(&json!{{ "op": 1, "d": null }}) {
+			Ok(()) => {}
+			Err(e) => warn!("Error sending the initial heartbeat message Error: {:?}", e)
+		};
+
 		let socket: SocketArtex = Arc::new(Mutex::new(socket));
 		let (tx, rx) = mpsc::channel();
-		let socket_clone = Arc::clone(&socket);
-		std::thread::Builder::new()
-			.name("Discord Keepalive tungstenite".into())
-			.spawn(move || keepalive(heartbeat_interval, socket_clone, rx))?;
+
+		let event = socket.lock().expect("Socket Mutex Poisoned").recv_json(GatewayEvent::decode)?;
+		if let GatewayEvent::HeartbeatAck = event {
+			let socket_clone = Arc::clone(&socket);
+			std::thread::Builder::new()
+				.name("Discord Keepalive tungstenite".into())
+				.spawn(move || keepalive(heartbeat_interval, socket_clone, rx))?;
+		} else {
+			return Err(Error::Protocol("Expected HeartbeatAck"))
+		}
+
+		// send the handshake
+		debug!("Sending Identity");
+		socket.lock().expect("Socket Mutex Poisoned").send_json(&identify)?;
 
 		// read the Ready event
 		let sequence;
@@ -566,7 +593,11 @@ fn build_url(base: &str) -> url::Url {
 
 fn keepalive(interval: u64, mut socket: SocketArtex, channel: mpsc::Receiver<Status>) {
 	debug!("Starting keep alive loop");
+	use rand::{thread_rng, Rng};
+	let mut rng = thread_rng();
+	let interval = (interval as f32 * rng.gen_range(0.0..1.0)) as u64;
 	let mut timer = Timer::new(interval);
+	debug!("Timer: {:?}", timer);
 	let mut last_sequence = 0;
 
 	'outer: loop {

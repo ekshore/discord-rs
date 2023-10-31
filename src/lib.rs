@@ -1657,6 +1657,7 @@ fn sleep_ms(millis: u64) {
 }
 
 // Timer that remembers when it is supposed to go off
+#[derive(Debug)]
 struct Timer {
 	next_tick_at: time::Instant,
 	tick_len: time::Duration,
@@ -1678,6 +1679,7 @@ impl Timer {
 	}
 
 	fn defer(&mut self) {
+		debug!("Checking keapalive timer");
 		self.next_tick_at = time::Instant::now() + self.tick_len;
 	}
 
@@ -1719,7 +1721,6 @@ impl ReceiverExt
 		use tungstenite::Message;
 
 		let message: Message = self.read().unwrap();
-		debug!("{}", message);
 
 		match message {
 			Message::Close(Some(frame)) => Err(Error::Closed(
@@ -1760,7 +1761,7 @@ impl ReceiverExt
 		use tungstenite::Message;
 
 		let message: Message = self.read().unwrap();
-		debug!("{}", message);
+		debug!("Inbound Message: {:?}", message);
 
 		match message {
 			Message::Close(Some(frame)) => Err(Error::Closed(
@@ -1796,6 +1797,7 @@ impl SenderExt
 {
 	fn send_json(&mut self, value: &serde_json::Value) -> Result<()> {
 		use tungstenite::Message;
+		debug!("Outbound Message: {:?}", &value);
 		serde_json::to_string(value)
 			.map(Message::Text)
 			.map_err(Error::from)

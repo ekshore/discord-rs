@@ -31,7 +31,8 @@ pub fn main() {
 			Ok(event) => event,
 			Err(err) => {
 				println!("[Warning] Receive error: {:?}", err);
-				if let discord::Error::WebSocket(..) = err {
+				//if let discord::Error::WebSocket(..) = err {
+				if let discord::Error::Tungstenite(..) = err {
 					// Handle the websocket connection being dropped
 					let (new_connection, ready) = discord.connect().expect("connect failed");
 					connection = new_connection;
